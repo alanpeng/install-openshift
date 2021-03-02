@@ -1,0 +1,443 @@
+﻿一、设置主机名、关闭防火墙及selinux
+hostnamectl set-hostname bastion.ocp4.wise2c.com
+vi /etc/selinux/config
+firewall-cmd --set-default-zone=trusted
+
+二、安装解压工具、dhcp服务包、dns服务包及docker
+yum install unzip dhcp bind bind-utils net-tools
+
+yum install -y yum-utils
+yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
+yum install docker-ce docker-ce-cli containerd.io
+systemctl enable docker
+systemctl start docker
+docker version
+
+三、安装docker-compose
+curl -L "https://github.com/docker/compose/releases/download/1.28.2/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+chmod +x /usr/local/bin/docker-compose
+docker-compose version
+
+修正内核ip转发参数
+vi /etc/sysctl.conf
+添加一行
+net.ipv4.ip_forward = 1
+然后
+sysctl -p
+
+四、配置dhcp和dns服务
+（1）DNS配置
+vi /etc/named.conf 
+
+将
+ 	listen-on port 53 { 127.0.0.1; };
+改为
+ 	listen-on port 53 { any; };
+
+将
+ 	allow-query     { localhost; };
+改为
+ 	allow-query     { any; };
+
+增加转发段配置
+        forwarders { 
+                114.114.114.114;
+                8.8.8.8;
+                8.8.4.4;
+        };
+
+将 
+ 	dnssec-enable yes;
+ 	dnssec-validation yes;
+改为
+ 	dnssec-enable no;
+ 	dnssec-validation no;
+
+增加区域配置
+zone "wise2c.com" IN {
+    type master;
+    file "wise2c.com.zone";
+};
+
+保存以上对/etc/named.conf的修改
+
+创建一个区域文件
+vi /var/named/wise2c.com.zone
+######################################################################################################
+$TTL 1W
+@       IN      SOA     ns1.wise2c.com.  root (
+                        2019070700      ; serial
+                        3H              ; refresh (3 hours)
+                        30M             ; retry (30 minutes)
+                        2W              ; expiry (2 weeks)
+                        1W )            ; minimum (1 week)
+        IN      NS      ns1.wise2c.com.
+        IN      MX 10   smtp.wise2c.com.
+;
+;
+ns1     IN      A       172.20.100.100
+smtp    IN      A       172.20.100.100
+;
+bastion.ocp4    IN      A       172.20.100.100
+;
+; The api identifies the IP of your load balancer.
+api.ocp4                IN      A       172.20.100.101
+api-int.ocp4            IN      A       172.20.100.101
+;
+; The wildcard also identifies the load balancer.
+*.apps.ocp4             IN      A       172.20.100.102
+;
+; Create entries for the vCenter host.
+vcenter.ocp4            IN      A       172.20.0.10
+vcenter                 IN      A       172.20.0.10
+;EOF
+######################################################################################################
+
+systemctl enable named
+systemctl restart named
+systemctl status named
+
+（2）DHCP配置
+vi /etc/dhcp/dhcpd.conf
+
+######################################################################################################
+# option definitions common to all supported networks...
+option domain-name "wise2c.com";
+option domain-name-servers 172.20.100.100;
+
+default-lease-time 600;
+max-lease-time 7200;
+
+subnet 172.20.0.0 netmask 255.255.0.0 {
+  range dynamic-bootp 172.20.200.1 172.20.200.200;
+  option domain-name-servers 172.20.100.100;
+  option domain-name "wise2c.com";
+  option routers 172.20.0.254;
+  option broadcast-address 172.20.255.255;
+  default-lease-time 600;
+  max-lease-time 7200;
+}
+######################################################################################################
+
+systemctl enable dhcpd
+systemctl restart dhcpd
+systemctl status dhcpd
+
+五、制作镜像仓库Harbor的自签名证书
+mkdir -p /root/ocp-offline/4.7.0
+cd /root/ocp-offline/4.7.0
+
+yum install git
+git clone https://github.com/alanpeng/self-signed-certificate
+cd self-signed-certificate
+./gen.cert.sh bastion.ocp4.wise2c.com
+cp out/bastion.ocp4.wise2c.com/root.crt ../harbor-server-root.crt
+cp out/bastion.ocp4.wise2c.com/bastion.ocp4.wise2c.com.crt ../harbor-server.crt
+cp out/bastion.ocp4.wise2c.com/bastion.ocp4.wise2c.com.key.pem ../harbor-server.key
+cp out/bastion.ocp4.wise2c.com/bastion.ocp4.wise2c.com.bundle.crt ../harbor-server.bundle.crt
+cd ..
+
+cp harbor-server-root.crt /etc/pki/ca-trust/source/anchors/
+cp harbor-server.crt /etc/pki/ca-trust/source/anchors/
+update-ca-trust extract
+
+六、安装Harbor
+curl -L https://github.com/goharbor/harbor/releases/download/v2.1.3/harbor-offline-installer-v2.1.3.tgz -o ./harbor-offline-installer-v2.1.3.tgz
+tar -zxf harbor-offline-installer-v2.1.3.tgz -C /opt/
+mkdir /opt/harbor/certs
+cp harbor-server.crt /opt/harbor/certs/
+cp harbor-server.key /opt/harbor/certs/
+
+cd /opt/harbor
+vi harbor.yml
+######################################################################################################
+hostname: bastion.ocp4.wise2c.com
+
+  # The path of cert and key files for nginx
+  certificate: /opt/harbor/certs/harbor-server.crt
+  private_key: /opt/harbor/certs/harbor-server.key
+
+# Remember Change the admin password from UI after launching Harbor.
+harbor_admin_password: Openshift4OCP
+######################################################################################################
+
+ ./install.sh
+
+vi /etc/systemd/system/harbor.service
+
+######################################################################################################
+[Unit]
+Description=Harbor
+After=docker.service systemd-networkd.service systemd-resolved.service
+Requires=docker.service
+Documentation=http://github.com/goharbor/harbor
+
+[Service]
+Type=simple
+Restart=on-failure
+RestartSec=5
+ExecStart=/usr/local/bin/docker-compose -f /opt/harbor/docker-compose.yml up
+ExecStop=/usr/local/bin/docker-compose -f /opt/harbor/docker-compose.yml down
+
+[Install]
+WantedBy=multi-user.target
+######################################################################################################
+
+systemctl enable harbor
+
+访问Harbor：
+http://bastion.ocp4.wise2c.com
+https://bastion.ocp4.wise2c.com
+
+七、安装jq工具后合并pull-secret.json文件
+yum install epel-release
+yum install jq 
+
+注册免费账号并获得下载密钥（ https://www.bilibili.com/video/BV1WK4y1a7y4?from=search&seid=2127325042398227100 ）
+cat ./pull-secret.txt | jq . > pull-secret.json
+
+echo -n 'admin:Openshift4OCP' | base64 -w0 > json-append.txt
+cat json-append.txt
+
+YWRtaW46T3BlbnNoaWZ0NE9DUA==
+
+######################################################################################################
+    "bastion.ocp4.wise2c.com": {
+      "auth": "YWRtaW46T3BlbnNoaWZ0NE9DUA==",
+      "email": "alan_peng@wise2c.com"
+   }
+######################################################################################################
+
+把上面内容加到pull-secret.json内容尾部，注意逗号及缩进对齐
+cat pull-secret.json
+
+######################################################################################################
+    "registry.redhat.io": {
+      "auth": "NTIwODkxNjN8dWhjLT......lIWGFBSWVfXpybw==",
+      "email": "alan_peng@wise2c.com"
+    },
+    "bastion.ocp4.wise2c.com": {
+      "auth": "YWRtaW46T3BlbnNoaWZ0NE9DUA==",
+      "email": "alan_peng@wise2c.com"
+   }
+  }
+}
+######################################################################################################
+
+八、下载openshift离线镜像
+（1）获取版本信息镜像包并推送到本地Harbor仓库
+cd /root/ocp-offline/4.7.0/
+docker pull quay.io/openshift-release-dev/ocp-release:4.7.0-x86_64
+or
+docker load -i ocp-release-4.7.0-x86_64.tar
+
+docker login bastion.ocp4.wise2c.com
+docker tag quay.io/openshift-release-dev/ocp-release:4.7.0-x86_64 bastion.ocp4.wise2c.com/library/ocp-release:4.7.0-x86_64
+docker push bastion.ocp4.wise2c.com/library/ocp-release:4.7.0-x86_64
+
+（2）下载最新的oc命令文件
+访问网站 https://mirror.openshift.com/pub/openshift-v4/clients/ocp/ 查看最新版本并下载：
+wget https://mirror.openshift.com/pub/openshift-v4/clients/ocp/4.7.0/openshift-client-linux-4.7.0.tar.gz
+tar zxvf openshift-client-linux.tar.gz 
+mv oc /usr/local/bin/
+mv kubectl /usr/local/bin/
+
+（3）解压开准确版本对应的oc命令及openshift-install命令
+oc adm release extract -a /root/ocp-offline/4.7.0/pull-secret.json --command=oc bastion.ocp4.wise2c.com/library/ocp-release:4.7.0-x86_64
+oc adm release extract -a /root/ocp-offline/4.7.0/pull-secret.json --command=openshift-install bastion.ocp4.wise2c.com/library/ocp-release:4.7.0-x86_64
+mv oc /usr/local/bin/
+mv openshift-install /usr/local/bin
+
+（4）查阅版本发布信息
+oc adm release info bastion.ocp4.wise2c.com/library/ocp-release:4.7.0-x86_64
+
+（5）登录Harbor创建一个ocp4的项目
+
+（6）下载离线镜像包
+     如果内网没有堡垒机可以上网，只能转存拷贝到离线环境，则用方法一：
+
+    （6-1)拷贝pull-secret.json文件和oc命令到有互联网权限的服务器（仅需要oc命令即可，视频里的讲解有点小错误，不需要是一台相同的Harbor服务器），执行：
+          ./oc adm -a ./pull-secret.json release mirror --from=quay.io/openshift-release-dev/ocp-release:4.7.0-x86_64 --to-dir ./
+
+    （6-2)将上面缓存的目录拷贝至内网服务器（注意不要使用scp拷贝，否则会导致软链接文件丢失而出现故障。建议将整个目录压缩打包拷贝），执行以下操作：
+          oc -a /root/ocp-offline/4.7.0/pull-secret.json image mirror --from-dir=./ 'file://openshift/release:4.7.0*' bastion.ocp4.wise2c.com/ocp4/openshift4
+
+     如果堡垒机同时可以访问互联网和内网的Harbor，则使用方法二，也是最省事的方法，直接在线由quay.io仓库转存至本地Harbor仓库：
+          oc adm -a pull-secret.json release mirror --from=quay.io/openshift-release-dev/ocp-release:4.7.0-x86_64 --to=bastion.ocp4.wise2c.com/ocp4/openshift4 --to-release-image=bastion.ocp4.wise2c.com/ocp4/openshift4:4.7.0-x86_64
+
+九、下载RHCOS虚拟机模板文件
+curl -L https://mirror.openshift.com/pub/openshift-v4/dependencies/rhcos/4.7/4.7.0/rhcos-4.7.0-x86_64-vmware.x86_64.ova -o ./rhcos-4.7.0-x86_64-vmware.x86_64.ova
+
+十、安装openshift
+（1）下载vCenter证书
+curl -k -L https://vcenter.wise2c.com/certs/download.zip -o ./vcenter-ca.zip
+unzip vcenter-ca.zip
+cp certs/lin/* /etc/pki/ca-trust/source/anchors
+update-ca-trust extract
+
+（2）创建初始化配置文件
+mkdir /opt/openshift
+ssh-keygen -t ed25519 -N '' -f /opt/openshift/id_rsa
+eval "$(ssh-agent -s)"
+ssh-add /opt/openshift/id_rsa
+openshift-install create install-config --dir=/opt/openshift --log-level=debug
+
+（3）修改/opt/openshift/install-config.yaml内容
+vi /opt/openshift/install-config.yaml
+######################################################################################################
+在defaultDatastore: datastore2下缩进对齐增加一行
+    folder: "/Datacenter/vm/OpenShift/ocp4"
+
+修改machineNetwork的值与实际虚拟宿主机网段一致
+  machineNetwork:
+  - cidr: 172.20.0.0/16
+
+对pull-secret内容做合并修复（可以访问内网的harbor）
+cat /root/ocp-offline/4.7.0/pull-secret.json|jq -c 来压缩成一行。
+
+底部增加一行
+sshKey: 'ssh-ed25519 AAAA...中间密文省略...sMkKCjwVO7N root@bastion.ocp4.wise2c.com'
+
+注意：上面的密文就是文件/opt/openshift/id_rsa.pub的内容
+
+增加Harbor的证书内容（注意证书内容缩进2个字符对齐）：
+additionalTrustBundle: |
+  -----BEGIN CERTIFICATE-----
+  MIIEeDCCA2CgAwIBAgICEAAwDQYJKoZIhvcNAQELBQAwaTELMAkGA1UEBhMCQ04x
+  EjAQBgNVBAgMCUd1YW5nZG9uZzESMBAGA1UEBwwJR3Vhbmd6aG91MRQwEgYDVQQK
+  DAtGaXNoZHJvd25lZDEcMBoGA1UEAwwTRmlzaGRyb3duZWQgUk9PVCBDQTAeFw0y
+  MTAyMTQxNTI4NDVaFw0zMTAyMTIxNTI4NDVaMIGfMQswCQYDVQQGEwJDTjESMBAG
+  A1UECAwJR3Vhbmdkb25nMRIwEAYDVQQHDAlHdWFuZ3pob3UxFDASBgNVBAoMC0Zp
+  c2hkcm93bmVkMScwJQYDVQQLDB5iYXN0aW9uLm9jcDQud2lzZW9wZW5zaGlmdC5j
+  b20xKTAnBgNVBAMMICouYmFzdGlvbi5vY3A0Lndpc2VvcGVuc2hpZnQuY29tMIIB
+  IjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAr14W0JEzL1EGGCiDDUju7IqM
+  Oa6DtXBT3S4H/2hM5FzWSB2F+1S2RQZTfeM81hMeJ743czRu3YSGvPziwEu/5YvT
+  Wkz/6NUuIYN6Sy32r2SIzENAaXfDyzc0wUgTLxjlUeaDpERcuA5fL4Dv2dXBcmSj
+  CV/eHPsosNd7ljscR+YoiOE4ZfJxg1l5rZ7VwFS3vSP0GI1g26lOe5yoEBsde56q
+  +Kjp7SBO4sz9WsCo0iP6xP6y34jiHAt6GMEBRF5bK7wZBwPEdZbOr+55iXKg6QID
+  AQABo4HyMIHvMAkGA1UdEwQCMAAwMwYJYIZIAYb4QgENBCYWJE9wZW5TU0wgR2Vu
+  ZXJhdGVkIFNlcnZlciBDZXJ0aWZpY2F0ZTAdBgNVHQ4EFgQUP0s1ZMBMrrzlXYOe
+  ETXCbi5DUaUwHwYDVR0jBBgwFoAU8iajAcFwrNC7XYp/gP5lnm6tHRYwCwYDVR0P
+  BAQDAgWgMBMGA1UdJQQMMAoGCCsGAQUFBwMBMEsGA1UdEQREMEKCICouYmFzdGlv
+  bi5vY3A0Lndpc2VvcGVuc2hpZnQuY29tgh5iYXN0aW9uLm9jcDQud2lzZW9wZW5z
+  aGlmdC5jb20wDQYJKoZIhvcNAQELBQADggEBAGacJyaoY8pJtUS2Of0aY8WlgrP4
+  0mRlRY1B1ope3VUqHOBo3dJdkiD0lXX3j4cmpTaHdPKBKTAjWgLCGIrhBCYUVI4C
+  In2P8TfjX7zKyPu4bK9net9EzqJpfkoitM7TPE5XgDjPqVV8YwxVWk8pW+nJxDWC
+  XPYf0Lcu8G7pZjbyDSHHHPKZk70dHDmISVNbhatICJY6OfMS0NgdGJWuqlUv/YgG
+  NdDQJ82Bn93zl6PDQHU0R0W5b5y9Lv3uON668HIwzw01TuMAxZ8NcnKPQMmANCDR
+  /EG+O1GNR9UAaN9Hp30FB+QBGzD6p2CeZnXreon+U2WLbCHOH4l5FQwfvYY=
+  -----END CERTIFICATE-----
+  -----BEGIN CERTIFICATE-----
+  MIIDuDCCAqCgAwIBAgIJAI0IV2tuTmMwMA0GCSqGSIb3DQEBCwUAMGkxCzAJBgNV
+  BAYTAkNOMRIwEAYDVQQIDAlHdWFuZ2RvbmcxEjAQBgNVBAcMCUd1YW5nemhvdTEU
+  MBIGA1UECgwLRmlzaGRyb3duZWQxHDAaBgNVBAMME0Zpc2hkcm93bmVkIFJPT1Qg
+  Q0EwHhcNMjEwMjE0MTUyODQ1WhcNNDEwMjA5MTUyODQ1WjBpMQswCQYDVQQGEwJD
+  TjESMBAGA1UECAwJR3Vhbmdkb25nMRIwEAYDVQQHDAlHdWFuZ3pob3UxFDASBgNV
+  BAoMC0Zpc2hkcm93bmVkMRwwGgYDVQQDDBNGaXNoZHJvd25lZCBST09UIENBMIIB
+  IjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA140QQAB2kqy/oc80V7DbpLLD
+  bAmNt8lD/94aZf2QL6mUgaFh/Da0VQheOaX6HFs62zQPvbEpQFs8YnzjDWIC0pNk
+  JiA0e2p/U297Z1KUAC/ciGC7bQEGe9Bz6K1akE3tFdBqyCdit1l9M9KC6S/d+Z1L
+  LfdOGrhq5QfPWUlYLUtlJrC4oCHPdq4iEM2SEIH5NZvxL2Ra0eQXfXQ8nFj8tgLa
+  pm7qMwkjuSAPLk3iPe/tWgWKOLLZe8PkGrnmmBy32ijZzTL9Jb98F9MnCPiHM5zj
+  SqcbWsB5p2r4gaCeJDT7NGcPCAE+6LKZWf4jbKYt+np80oXEpT1HfREKY+20bQID
+  AQABo2MwYTAdBgNVHQ4EFgQU8iajAcFwrNC7XYp/gP5lnm6tHRYwHwYDVR0jBBgw
+  FoAU8iajAcFwrNC7XYp/gP5lnm6tHRYwDwYDVR0TAQH/BAUwAwEB/zAOBgNVHQ8B
+  Af8EBAMCAYYwDQYJKoZIhvcNAQELBQADggEBAE+NiRx++zsj9bv75Zc3jAnHlIHx
+  wat7U6G5dl1EZrAgduzOsif9i1Yj65/oxshe9hWiwpqb39uFJ7T2FIRpx/NW9EhT
+  S4vhU7m6JbuttyqClBwx1tJrPnF1ZxAJAQY/x6w5VmRTbAZl0E7H2eseS47/hwF1
+  UddxbZhIqZwC4DPEph71IZTRmWIiHwYVgIwisK+K58/yWMjGKt53llGZHkGb93kP
+  0JAxNDYJ+6Jah36KVz16QEfPHrS5sBdxqGHENpkY2urB872rdakOo2ifYHB1WOgb
+  MGypXLXdo6pwKlhJ3St09xlsE2vM6fgnAYluqC4Q7WaRTdw/JiWLatFOzhM=
+  -----END CERTIFICATE-----
+imageContentSources:
+- mirrors:
+  - bastion.ocp4.wise2c.com/ocp4/openshift4
+  source: quay.io/openshift-release-dev/ocp-release
+- mirrors:
+  - bastion.ocp4.wise2c.com/ocp4/openshift4
+  source: quay.io/openshift-release-dev/ocp-v4.0-art-dev
+######################################################################################################
+
+cp /opt/openshift/install-config.yaml /root/ocp-offline/4.7.0/
+
+（4）安装Openshift
+openshift-install create cluster --dir=/opt/openshift --log-level=debug
+
+第一次安装提示需要下载RHCOS模板镜像文件：
+......
+INFO Obtaining RHCOS image file from 'https://releases-art-rhcos.svc.ci.openshift.org/art/storage/releases/rhcos-4.7/47.83.202102090044-0/x86_64/rhcos-47.83.202102090044-0-vmware.x86_64.ova?sha256=13d92692b8eed717ff8d0d113a24add339a65ef1f12eceeb99dabcd922cc86d1' 
+DEBUG Unpacking file into "/root/.cache/openshift-installer/image_cache/3b90b8f621548d33b166787e8d70207d"... 
+DEBUG no known archive format detected for image, assuming no decompression necessary 
+......
+
+如果网络好，直接等待一会即可自动进行后续步骤，否则可以Ctrl+C终止安装，将提前准备好的镜像文件放在要求的缓存目录即可。
+
+这里可以直接使用第九步下载的文件，也可以提前下载好准确URL对应的文件后直接拷贝为临时缓存文件（推荐使用安装过程中提示所需的精准匹配的版本，比如这里使用rhcos-47.83.202102090044-0-vmware.x86_64.ova更合适）
+curl -L https://releases-art-rhcos.svc.ci.openshift.org/art/storage/releases/rhcos-4.7/47.83.202102090044-0/x86_64/rhcos-47.83.202102090044-0-vmware.x86_64.ova?sha256=13d92692b8eed717ff8d0d113a24add339a65ef1f12eceeb99dabcd922cc86d1 -o ./rhcos-47.83.202102090044-0-vmware.x86_64.ova
+cp ./rhcos-47.83.202102090044-0-vmware.x86_64.ova /root/.cache/openshift-installer/image_cache/3b90b8f621548d33b166787e8d70207d
+或
+curl -L https://mirror.openshift.com/pub/openshift-v4/dependencies/rhcos/4.7/4.7.0/rhcos-4.7.0-x86_64-vmware.x86_64.ova -o ./rhcos-4.7.0-x86_64-vmware.x86_64.ova
+cp ./rhcos-4.7.0-x86_64-vmware.x86_64.ova /root/.cache/openshift-installer/image_cache/3b90b8f621548d33b166787e8d70207d
+
+清理/opt/openshift目录后再安装：
+openshift-install destroy --dir=/opt/openshift --log-level=debug
+rm -rf /opt/openshift
+mkdir /opt/openshift
+cp /root/ocp-offline/4.7.0/install-config.yaml /opt/openshift/
+openshift-install create cluster --dir=/opt/openshift --log-level=debug
+
+十一、如果机器性能较慢，不能在第一轮安装过程中等到集群ready，则可以在不同阶段分别执行以下两条命令
+openshift-install wait-for bootstrap-complete --dir=/opt/openshift --log-level=debug
+openshift-install wait-for install-complete --dir=/opt/openshift --log-level=debug
+
+机器性能好，则会很快看见bootstrap服务器完成任务并自动销毁。一般来说create cluster命令较难在默认的等待过程中就返回全部部署工作的ready状态，那么可以随时运行上述第二条命令。
+
+十二、集群节点执行初始化过程时间较久，如何观测进展：
+######################################################################################################
+IPI方式的worker节点并不需要执行下面命令后才出现，而是自动批准的：
+oc get csr -o name | xargs oc adm certificate approve
+
+有一个问题，发现worker虚机在一个vCenter环境不自动创建，最终发现原因是vcenter的FQDN和测试的ocp使用的不一致且未放入dns服务记录内导致。
+如果你的vcenter使用的域名正好和ocp使用的域名不一致，就要特别注意了，请在bind的dns配置里做好解析工作。
+
+https://github.com/openshift/okd/issues/386
+
+Here's your issue.
+
+There are a bunch of these in must-gather.local.331163555932549138/quay-io-openshift-okd-content-sha256-5a9b4b4cdd15e8587d02490cf753c385213e6a97e5c2bf7babf416585e42fd70/namespaces/openshift-machine-api/pods/machine-api-controllers-6c4f6c6dc8-vd8x5/machine-controller/machine-controller/logs/current.log:
+
+namespaces/openshift-machine-api/pods/machine-api-controllers-6c4f6c6dc8-vd8x5/machine-controller/machine-controller/logs/current.log:2020-11-24T21:13:43.289573655Z E1124 21:13:43.289519 1 controller.go:272] lab-5jjb9-worker-v9sp8: failed to check if machine exists: lab-5jjb9-worker-v9sp8: failed to create scope for machine: failed to create vSphere session: error setting up new vSphere SOAP client: Post https://sacla300.sac.flex.com/sdk: dial tcp: lookup sacla300.sac.flex.com on 172.30.0.10:53: no such host
+
+It can't find your vSphere host in DNS
+
+In mine I get:
+
+sh-4.2$ nslookup vcenter.maeagle.corp
+Server:         172.30.0.10
+Address:        172.30.0.10#53
+
+Name:   vcenter.maeagle.corp
+Address: 10.199.202.180
+Once you figure out what is going on with DNS I'll bet this will work. First thing I would check is can you resolve it from one of the master hosts... what does the /etc/resolve.conf look like.
+
+worker节点初始化工作没结束，整个集群的ingress等组件是起不来的，那么oc get co也就拿不到全部的组件可用信息，查看openshift的worker节点解压镜像进度，最大的image解压在/run目录，大概是1G大小，这个过程结束后就很快了。
+
+性能非常好的环境就不用折腾这些观测工作了，喝完一杯茶，集群就可以使用了。
+#!/bin/bash
+echo 'size of /run on 172.20.200.5'
+ssh core@172.20.200.5 sudo du -sh /run
+echo
+echo 'size of /run on 172.20.200.6'
+ssh core@172.20.200.6 sudo du -sh /run
+echo
+echo 'size of /run on 172.20.200.7'
+ssh core@172.20.200.7 sudo du -sh /run
+
+集群起来后，可以使用以下命令访问、获取集群部署进展：
+export KUBECONFIG=/opt/openshift/auth/kubeconfig
+
+oc get nodes -o wide
+
+oc get clusterversion
+
+oc get clusteroperator
